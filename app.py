@@ -177,6 +177,18 @@ def startup():
 
 
 startup()
+@app.route("/wake")
+def wake():
+    """Force immediate refresh for cold starts"""
+    global current_url, last_slug, last_updated
+    url = fetch_live_btc5m_url()
+    new_slug = url.split("/")[-1]
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    with lock:
+        current_url  = url
+        last_slug    = new_slug
+        last_updated = now
+    return f"Woke! Now pointing to: {url}"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, use_reloader=False)
