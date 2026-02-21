@@ -1,175 +1,219 @@
 #!/usr/bin/env python3
 """
-app.py — Polymarket BTC 5m Live Link Server ("soonest end" version)
+app.py — Polymarket BTC 5m Live Link Server v3.0
 
-Selects the active BTC 5-minute market whose end time is the
-soonest in the future, using logic analogous to PolymarketAPI
-from polymarket_bot.py.
+Strategy: compute the current 5-minute window slug DIRECTLY from the
+system clock (UTC rounded down to nearest 5 min), matching Polymarket's
+slug naming convention: btc-updown-5m-{unix_ts_of_window_start_utc}
+
+Falls back to Gamma API discovery (mirrors polymarket_bot.py) if the
+computed slug doesn't exist on Polymarket.
 """
 
+import re
 import time
 import threading
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from datetime import datetime, timezone, timedelta
+from typing import Optional, List, Dict
 
 import requests
 from flask import Flask, redirect, jsonify
 
-# ── Config ────────────────────────────────────────────────────────────────────
+# ── Config ─────────────────────────────────────────────────────────────────
 GAMMA_API        = "https://gamma-api.polymarket.com"
-CRYPTO_TAG_ID    = 100381          # same as PolymarketAPI.CRYPTO_TAG_ID
-BTC_5MIN_SLUG    = "-5m-"          # matches cfg.btc_5min_slug_pattern
-REFRESH_EVERY    = 15              # seconds
-KEEP_ALIVE_EVERY = 600             # seconds
+BTC_5MIN_SERIES  = "10684"          # btc_5min_series_id in BotConfig
+CRYPTO_TAG_ID    = 100381           # PolymarketAPI.CRYPTO_TAG_ID
 FALLBACK_URL     = "https://polymarket.com/crypto/5M"
+REFRESH_EVERY    = 10               # seconds — recalculates every 10s
+KEEP_ALIVE_EVERY = 600              # seconds
+POLYMARKET_BASE  = "https://polymarket.com/event"
 
-# ── Regex-like helpers from polymarket_bot.py (simplified) ───────────────────
-import re
-DUR_RE = re.compile(r"(\d{1,2}):?(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):?(\d{2})\s*(AM|PM)", re.IGNORECASE)
+# mirrors polymarket_bot.py helpers
+DUR_RE = re.compile(
+    r"(\d{1,2}):?(\d{2})\s*(AM|PM)\s*-\s*(\d{1,2}):?(\d{2})\s*(AM|PM)",
+    re.IGNORECASE
+)
 FIVEMIN_KEYWORDS = re.compile(r"5-?min(ute)?s?|5m", re.IGNORECASE)
+
+# ── State ──────────────────────────────────────────────────────────────────
+current_url  = FALLBACK_URL
+last_updated = "never"
+last_method  = "none"
+lock         = threading.Lock()
+app          = Flask(__name__)
+
+SESSION = requests.Session()
+SESSION.headers.update({"User-Agent": "PolyLinkServer/3.0", "Accept": "application/json"})
+
+
+# ── Timestamp-based slug (primary method) ─────────────────────────────────
+
+def compute_slug_for_window(dt_utc: datetime) -> str:
+    """Round dt_utc DOWN to nearest 5-min boundary -> slug timestamp."""
+    minutes = (dt_utc.minute // 5) * 5
+    window_start = dt_utc.replace(minute=minutes, second=0, microsecond=0)
+    ts = int(window_start.timestamp())
+    return f"btc-updown-5m-{ts}"
+
+
+def slug_exists(slug: str) -> bool:
+    """Verify slug exists via Gamma events API."""
+    try:
+        r = SESSION.get(f"{GAMMA_API}/events/{slug}", timeout=8)
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def get_url_by_timestamp() -> Optional[str]:
+    """
+    Build slug from current UTC time. Try current window first,
+    then next window (in case current just resolved), then previous.
+    """
+    now_utc = datetime.now(timezone.utc)
+    candidates = [
+        now_utc,                            # current window
+        now_utc + timedelta(minutes=5),     # next window (if current just closed)
+        now_utc - timedelta(minutes=5),     # previous window (buffer)
+    ]
+    for candidate in candidates:
+        slug = compute_slug_for_window(candidate)
+        if slug_exists(slug):
+            return f"{POLYMARKET_BASE}/{slug}"
+    return None
+
+
+# ── API-based discovery (fallback — mirrors polymarket_bot.py) ────────────
+
+def _slug_duration(slug: str) -> Optional[int]:
+    s = (slug or "").lower()
+    if "-5m-" in s: return 5
+    if "-15m-" in s: return 15
+    if "-1h-" in s: return 60
+    return None
 
 
 def _parse_duration(question: str) -> int:
     m = DUR_RE.search(question or "")
     if not m:
         return 15
-
-    def to_min(h: str, mn: str, ap: str) -> int:
+    def to_min(h, mn, ap):
         hi, mni = int(h), int(mn)
         ap = ap.upper()
-        if ap == "PM" and hi != 12:
-            hi += 12
-        elif ap == "AM" and hi == 12:
-            hi = 0
+        if ap == "PM" and hi != 12: hi += 12
+        elif ap == "AM" and hi == 12: hi = 0
         return hi * 60 + mni
-
     start = to_min(m.group(1), m.group(2), m.group(3))
-    end = to_min(m.group(4), m.group(5), m.group(6))
-    diff = end - start
-    if diff <= 0:
-        diff += 1440
+    end   = to_min(m.group(4), m.group(5), m.group(6))
+    diff  = end - start
+    if diff <= 0: diff += 1440
     return diff if 1 <= diff <= 60 else 15
 
 
-def _slug_duration(slug: str) -> Optional[int]:
-    s = (slug or "").lower()
-    if "-5m-" in s:
-        return 5
-    if "-15m-" in s:
-        return 15
-    if "-1h-" in s:
-        return 60
-    if "up-or-down" in s and s.endswith("-et"):
-        return 60
-    return None
-
-
-# ── State ─────────────────────────────────────────────────────────────────────
-current_url  = FALLBACK_URL
-last_updated = "never"
-lock         = threading.Lock()
-app          = Flask(__name__)
-
-
-# ── Core discovery: find soonest-ending BTC 5m market ────────────────────────
-
-def fetch_btc_5m_markets() -> List[Dict]:
-    """Fetch active crypto markets and filter to BTC 5m.
-
-    Mirrors PolymarketAPI._fetch_markets_for_5min_discovery + _discover_5min.
+def get_url_via_api() -> Optional[str]:
     """
-    session = requests.Session()
-    session.headers.update({"User-Agent": "PolyLinkServer/2.0", "Accept": "application/json"})
-
-    params = {"active": "true", "closed": "false", "limit": 200, "tag_id": CRYPTO_TAG_ID}
-    try:
-        r = session.get(f"{GAMMA_API}/markets", params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list):
-            data = data.get("data", [])
-    except Exception as e:
-        print(f"[MARKETS] primary tag query failed: {e}")
-        # broad fallback without tag
-        try:
-            r = session.get(f"{GAMMA_API}/markets", params={"active": "true", "closed": "false", "limit": 200}, timeout=10)
-            r.raise_for_status()
-            data = r.json()
-            if not isinstance(data, list):
-                data = data.get("data", [])
-        except Exception as e2:
-            print(f"[MARKETS] broad query failed: {e2}")
-            return []
-
-    btc_5m: List[Dict] = []
-    for mkt in data:
-        q = (mkt.get("question") or "").lower()
-        slug = (mkt.get("slug") or "").lower()
-        if not ("bitcoin" in q or "btc" in q):
-            continue
-
-        dur = _slug_duration(slug)
-        if dur is None:
-            dur = _parse_duration(mkt.get("question", ""))
-        keyword_match = bool(FIVEMIN_KEYWORDS.search(mkt.get("question", "")))
-        slug_match = "-5m-" in slug
-        if dur != 5 and not keyword_match and not slug_match:
-            continue
-
-        # Enrich with end_ms similar to _enrich()
-        end_str = mkt.get("endDate") or mkt.get("end_date")
-        if not end_str:
-            continue
-        try:
-            end_ms = datetime.fromisoformat(end_str.replace("Z", "+00:00")).timestamp() * 1000
-        except Exception:
-            continue
-
-        m = dict(mkt)
-        m["duration_min"] = 5
-        m["end_ms"] = end_ms
-        btc_5m.append(m)
-
-    return btc_5m
-
-
-def pick_soonest_btc_5m_url() -> str:
-    markets = fetch_btc_5m_markets()
-    if not markets:
-        print("[PICK] no BTC 5m markets found, using fallback")
-        return FALLBACK_URL
-
+    Mirrors PolymarketAPI._fetch_series + _discover_5min + _enrich.
+    Queries series_id=10684, then broad scan. Returns soonest-ending
+    BTC 5m market whose endDate is in the future.
+    """
     now_ms = datetime.now(timezone.utc).timestamp() * 1000
-    # keep only markets that end in the future
-    future = [m for m in markets if m["end_ms"] > now_ms]
-    if not future:
-        print("[PICK] no future BTC 5m markets, using fallback")
-        return FALLBACK_URL
+    candidates: List[Dict] = []
 
-    future.sort(key=lambda m: m["end_ms"])  # soonest end first
-    best = future[0]
-    slug = best.get("slug")
-    if not slug:
-        print("[PICK] best market missing slug, using fallback")
-        return FALLBACK_URL
+    # Path A: series_id (mirrors _fetch_series)
+    for param_key in ["series_id", "seriesId"]:
+        try:
+            r = SESSION.get(
+                f"{GAMMA_API}/events",
+                params={param_key: BTC_5MIN_SERIES, "active": "true", "closed": "false"},
+                timeout=10
+            )
+            r.raise_for_status()
+            events = r.json()
+            if not isinstance(events, list): events = [events]
+            for ev in events:
+                slug = (ev.get("slug") or "").lower()
+                if "-5m-" in slug and ("btc" in slug or "bitcoin" in slug):
+                    end_str = ev.get("endDate") or ev.get("end_date")
+                    if end_str:
+                        try:
+                            end_ms = datetime.fromisoformat(
+                                end_str.replace("Z", "+00:00")
+                            ).timestamp() * 1000
+                            if end_ms > now_ms:
+                                candidates.append({"slug": ev["slug"], "end_ms": end_ms})
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"[API-A:{param_key}] {e}")
 
-    url = f"https://polymarket.com/event/{slug}"
-    end_dt = datetime.fromtimestamp(best["end_ms"] / 1000, tz=timezone.utc).astimezone()
-    print(f"[PICK] chose {slug} ending at {end_dt.isoformat()}")
-    return url
+    # Path B: /markets tag scan (mirrors _discover_5min)
+    if not candidates:
+        for tag_id in [CRYPTO_TAG_ID, None]:
+            params = {"active": "true", "closed": "false", "limit": 200}
+            if tag_id: params["tag_id"] = tag_id
+            try:
+                r = SESSION.get(f"{GAMMA_API}/markets", params=params, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                if not isinstance(data, list): data = data.get("data", [])
+                for mkt in data:
+                    q    = (mkt.get("question") or "").lower()
+                    slug = (mkt.get("slug") or "").lower()
+                    if not ("bitcoin" in q or "btc" in q): continue
+                    dur = _slug_duration(slug)
+                    if dur is None: dur = _parse_duration(mkt.get("question", ""))
+                    kw  = bool(FIVEMIN_KEYWORDS.search(mkt.get("question", "")))
+                    if dur != 5 and not kw and "-5m-" not in slug: continue
+                    end_str = mkt.get("endDate") or mkt.get("end_date")
+                    if not end_str: continue
+                    try:
+                        end_ms = datetime.fromisoformat(
+                            end_str.replace("Z", "+00:00")
+                        ).timestamp() * 1000
+                        if end_ms > now_ms:
+                            candidates.append({"slug": mkt["slug"], "end_ms": end_ms})
+                    except Exception:
+                        pass
+                if candidates: break
+            except Exception as e:
+                print(f"[API-B] {e}")
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x["end_ms"])
+    best = candidates[0]
+    print(f"[API] chose slug={best['slug']}")
+    return f"{POLYMARKET_BASE}/{best['slug']}"
 
 
-# ── Background refresh + keep-alive ──────────────────────────────────────────
+# ── Master fetch: timestamp first, API fallback ────────────────────────────
+
+def fetch_live_url() -> tuple:
+    """Returns (url, method_used)."""
+    url = get_url_by_timestamp()
+    if url:
+        return url, "timestamp"
+    print("[FETCH] timestamp method failed, trying API fallback")
+    url = get_url_via_api()
+    if url:
+        return url, "api"
+    print("[FETCH] both methods failed, using fallback")
+    return FALLBACK_URL, "fallback"
+
+
+# ── Background threads ────────────────────────────────────────────────────
 
 def refresh_loop():
-    global current_url, last_updated
+    global current_url, last_updated, last_method
     while True:
         try:
-            url = pick_soonest_btc_5m_url()
+            url, method = fetch_live_url()
             now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             with lock:
-                current_url = url
+                current_url  = url
                 last_updated = now
+                last_method  = method
         except Exception as e:
             print(f"[REFRESH ERROR] {e}")
         time.sleep(REFRESH_EVERY)
@@ -180,13 +224,14 @@ def keep_alive():
     while True:
         time.sleep(KEEP_ALIVE_EVERY)
         try:
-            requests.get("http://localhost:5000/status", timeout=5)
+            SESSION.get("http://localhost:5000/status", timeout=5)
             print("[KEEP-ALIVE] ping")
-        except Exception as e:
-            print(f"[KEEP-ALIVE ERROR] {e}")
+        except Exception:
+            pass
 
 
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────
+
 @app.route("/live")
 def live():
     with lock:
@@ -198,30 +243,35 @@ def live():
 def status():
     with lock:
         return jsonify({
-            "current_url": current_url,
-            "last_updated": last_updated,
+            "current_url":       current_url,
+            "last_updated":      last_updated,
+            "last_method":       last_method,
             "refresh_every_sec": REFRESH_EVERY,
-            "fallback_url": FALLBACK_URL,
         })
 
 
 @app.route("/")
 def index():
     return jsonify({
-        "service": "Polymarket BTC 5m Live Link Server (soonest end)",
-        "routes": {"/live": "Redirects to soonest-ending BTC 5m market", "/status": "Current URL & metadata"},
+        "service": "Polymarket BTC 5m Link Server v3.0",
+        "routes": {
+            "/live":   "Redirects to current BTC 5m market",
+            "/status": "JSON: current URL, method used, last update time"
+        }
     })
 
 
-# ── Startup ───────────────────────────────────────────────────────────────────
+# ── Startup ───────────────────────────────────────────────────────────────
 
 def startup():
-    global current_url, last_updated
-    current_url = pick_soonest_btc_5m_url()
+    global current_url, last_updated, last_method
+    url, method = fetch_live_url()
+    current_url  = url
     last_updated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[INIT] starting at {current_url}")
+    last_method  = method
+    print(f"[INIT] method={method} url={url}")
     threading.Thread(target=refresh_loop, daemon=True).start()
-    threading.Thread(target=keep_alive, daemon=True).start()
+    threading.Thread(target=keep_alive,   daemon=True).start()
 
 
 startup()
